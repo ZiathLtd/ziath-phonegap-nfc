@@ -296,6 +296,24 @@
     [self sessionDidBecomeActive:session];
 }
 
+- (NSString *)createJSONStringWithMessage:(NSString *)message isProcessCompleted:(BOOL)isProcessCompleted{
+    NSDictionary *responseDict = @{
+        @"message": message,
+        @"isProcessCompleted": @(isProcessCompleted)
+    };
+
+    NSError *error;
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:responseDict options:0 error:&error];
+    if(!jsonData){
+        NSLog(@"Failed to serialize JSON: %@",error);
+        return nil;
+    } else {
+        NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+         NSLog(@"Encoded JSON String: %@",jsonString);
+        return jsonString;
+    }
+}
+
 - (void)tagReaderSession:(NFCTagReaderSession *)session didDetectTags:(NSArray<__kindof id<NFCTag>> *)tags API_AVAILABLE(ios(13.0)) {
     NSLog(@"tagReaderSession didDetectTags");
 
@@ -321,44 +339,41 @@
         NSLog(@"Tag Connected with session");
         if([tag conformsToProtocol:@protocol(NFCISO15693Tag)])
         {
+            NSString *initialMessage = [self createJSONStringWithMessage:@"Connected" isProcessCompleted:NO];
+            CDVPluginResult *initialResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_NO_RESULT messageAsString:initialMessage];
+            [initialResult setKeepCallbackAsBool:YES];
+            [self.commandDelegate sendPluginResult:initialResult callbackId:self->sessionCallbackId];
             dispatch_group_t readGroup = dispatch_group_create();
             NSMutableData *consolidatedData = [NSMutableData data];
+            [self sendMessageToJavaScript:@"Connected"];
             NSLog(@"Tag Confirms to ISO15693 Protocol");
             id<NFCISO15693Tag> iso15693Tag = (id<NFCISO15693Tag>)tag;
             __block NSInteger blockNumber = 0;
             __block NSInteger errCount = 0;
+            NSInteger totalNumberOfBlocks = 247;
+            __block BOOL hasCompleted = NO;
+            __block NSInteger oldProgressUpdate = -1;
             void (^readNextBlock)(void) = ^{
-                if (blockNumber >= 247) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        if ([consolidatedData length] > 0) {
-                            NSData *data = [consolidatedData copy];
-                            NSString *dataString = [data base64EncodedStringWithOptions:0];
-                            CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:dataString];
-                            [self.commandDelegate sendPluginResult:pluginResult callbackId:self->sessionCallbackId];
-                            blockNumber++;
-                        } else {
-                            // No data read
-                            NSString *dataString = @"No Data Read";
-                            CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:dataString];
-                            [self.commandDelegate sendPluginResult:pluginResult callbackId:self->sessionCallbackId];
-                            blockNumber++;
-                        }
-                        [session invalidateSession];
-                    });
-                } else {
+                if (blockNumber < totalNumberOfBlocks) {
                     dispatch_group_enter(readGroup);
                     [iso15693Tag readSingleBlockWithRequestFlags:NFCISO15693RequestFlagHighDataRate blockNumber:blockNumber completionHandler:^(NSData *dataBlock, NSError *error) {
                         NSLog(@"Read Single Block Invoked for block %ld", (long)blockNumber);
                         if (error) {
                             NSLog(@"Error Recieved in : Read Single Block");
-                            errCount++;
+                            [self sendDisconnectMessage:@"Disconnected"];
+                            dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC);
+                            dispatch_after(delay, dispatch_get_main_queue(), ^{
+                                NSLog(@"retrying after 1 sec");
+                                errCount++;
+                            });
                             if(errCount>=10)
                             {
                                 blockNumber = 249;
                                 [self handleError:error];
                                  // No data read
                                 NSString *dataString = @"No Data Read";
-                                CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:dataString];
+                                NSString *finalMessage = [self createJSONStringWithMessage:dataString isProcessCompleted:NO];
+                                CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:dataString];
                                 [self.commandDelegate sendPluginResult:pluginResult callbackId:self->sessionCallbackId];
                                 [session invalidateSession];
                             }
@@ -368,9 +383,30 @@
                             [consolidatedData appendData:dataBlock];
                             blockNumber++;
                             errCount = 0;
+                            NSInteger progressUpdate = (blockNumber * 100) / totalNumberOfBlocks;
+                            if(progressUpdate % 10 ==0 && (progressUpdate != oldProgressUpdate)) {
+                                oldProgressUpdate = progressUpdate;
+                                [self sendProgressUpdateToJavaScript:progressUpdate];
+                            }
                         }
                         dispatch_group_leave(readGroup);
                     }];
+                } else if(!hasCompleted) {
+                        hasCompleted = YES;
+                        if ([consolidatedData length] > 0) {
+                            NSData *data = [consolidatedData copy];
+                            NSString *dataString = [data base64EncodedStringWithOptions:0];
+                            NSString *finalMessage = [self createJSONStringWithMessage:dataString isProcessCompleted:YES];
+                            CDVPluginResult *finalResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:finalMessage];
+                            [self.commandDelegate sendPluginResult:finalResult callbackId:self->sessionCallbackId];
+                        } else {
+                            // No data read
+                            NSString *dataString = @"No Data Read";
+                            NSString *finalMessage = [self createJSONStringWithMessage:dataString isProcessCompleted:NO];
+                            CDVPluginResult *finalResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:finalMessage];
+                            [self.commandDelegate sendPluginResult:finalResult callbackId:self->sessionCallbackId];
+                        }
+                        [session invalidateSession];
                 }
             };
             dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
@@ -385,6 +421,23 @@
         }
 
     }];
+}
+- (void)sendProgressUpdateToJavaScript:(NSInteger)progressUpdate {
+    NSLog(@"message progress update Invoked");
+    NSString *jsString = [NSString stringWithFormat:@"document.dispatchEvent(new CustomEvent('nfcProgress', { 'detail': { 'progress' : %ld }}));", (long)progressUpdate];
+    [self.commandDelegate evalJs:jsString];
+}
+
+- (void)sendMessageToJavaScript:(NSString *)message {
+    NSLog(@"message Connected Invoked");
+    NSString *jsString = [NSString stringWithFormat:@"document.dispatchEvent(new CustomEvent('nfcConnect', { 'detail': {'message' : 'Connected'}}));"];
+    [self.commandDelegate evalJs:jsString];
+}
+
+- (void)sendDisconnectMessage:(NSString *)message {
+    NSLog(@"message disconnected Invoked");
+    NSString *jsString = [NSString stringWithFormat:@"document.dispatchEvent(new CustomEvent('nfcDisconnect', { 'detail': {'message' : 'Disconnected'}}));"];
+    [self.commandDelegate evalJs:jsString];
 }
 
 - (void)tagReaderSession:(NFCTagReaderSession *)session didInvalidateWithError:(NSError *)error API_AVAILABLE(ios(13.0)) {
@@ -417,7 +470,7 @@
             self.nfcSession = [[NFCNDEFReaderSession alloc]initWithDelegate:self queue:nil invalidateAfterFirstRead:TRUE];
         }
         sessionCallbackId = [command.callbackId copy];
-        self.nfcSession.alertMessage = @"Hold near NFC tag to scan.";
+        self.nfcSession.alertMessage = @"Processing RITRack Tag.";
        
         [self.nfcSession beginSession];
         
@@ -736,6 +789,12 @@
 }
 
 @end
+
+
+
+
+
+
 
 
 
